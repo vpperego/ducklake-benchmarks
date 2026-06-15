@@ -1,0 +1,24 @@
+# PostgreSQL metadata catalog for the DuckLake benchmark.
+#
+# Postgres data (pg_data) is persisted in the named volume `pg_data`, mounted at
+# the container's PGDATA directory. `docker compose down` removes the container
+# but keeps the volume; use `docker compose down -v` to wipe the data.
+
+services:
+  postgres:
+    build: .
+    image: ducklake-pg:latest
+    container_name: ducklake-pg
+    ports:
+      - "5432:5432"
+    volumes:
+      - pg_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ducklake -d ducklake_catalog"]
+      interval: 3s
+      timeout: 3s
+      retries: 30
+      start_period: 5s
+
+volumes:
+  pg_data:

@@ -1,23 +1,24 @@
-"""DuckLake INSERT benchmark over the DuckDB Quack client-server protocol.
+"""DuckLake INSERT benchmark over the DuckDB Quack client–server protocol.
 
-Architecture (two independent DuckDB instances connected over Quack/HTTP):
+Catalog backend: a local **DuckDB file** (``server_catalog.ducklake``).
 
-  * **Server** – a DuckDB instance that attaches a DuckLake catalog whose
-    ``DATA_PATH`` is ``data_files_server/``, creates a date-partitioned
-    ``user`` table there, and starts the Quack server on localhost.
+The benchmark runs as the **client** process. It launches ``server.py`` as a
+separate process (the **server**), waits for it to start listening, runs the two
+insertion strategies against the remote DuckLake table, and then terminates the
+server process.
 
-  * **Client** – a second, independent DuckDB instance that attaches the
-    remote via Quack (``ATTACH 'quack:localhost'``) and inserts rows through
-    the ``remote_db.query()`` table macro. Every statement is one HTTP
-    round-trip to the server, so the benchmark measures the real client-server
-    INSERT cost.
+Two independent DuckDB *processes* talk over Quack (HTTP on localhost):
 
-Two insertion strategies are compared for a given ``number of rows``:
+  * **server.py** (subprocess) – attaches a DuckLake catalog whose ``DATA_PATH``
+    is ``data_files_server/``, creates the date-partitioned ``user`` table, and
+    serves it over Quack until the benchmark terminates it.
+  * **benchmark.py** (this process, client) – attaches the remote via Quack
+    (``ATTACH 'quack:localhost'``) and inserts rows through the
+    ``remote_db.query()`` table macro. Every statement is one HTTP round-trip to
+    the server, so the benchmark measures the real client–server INSERT cost.
 
-  1. ``benchmark_single_row_inserts`` – one INSERT statement per row.
-  2. ``benchmark_multi_row_insert``    – a single INSERT with all rows.
-
-Each strategy is timed with ``time.perf_counter`` and the result is printed.
+The INSERT methodology itself (row generation, statement building, timing,
+printing) is shared with the rest of the suite via :mod:`bench_common`.
 
 Usage::
 
@@ -28,87 +29,96 @@ from __future__ import annotations
 
 import argparse
 import os
-import random
+import queue
+import subprocess
+import sys
+import threading
 import time
-from datetime import date, timedelta
+from pathlib import Path
 
 import duckdb
 
+from bench_common import QuackRunner, run_insert_benchmark, data_dir_summary
+
 # --- configuration ---------------------------------------------------------
 
-DATA_DIR = "data_files_server"          # where DuckLake writes parquet data
-CATALOG_FILE = "server_catalog.ducklake" # DuckLake metadata catalog file
-CATALOG_ALIAS = "lake"                   # server-side catalog alias
-TABLE = "user"                           # benchmark target table
-TOKEN = "benchtoken1234"                 # shared Quack auth token
-HOST = "localhost"                       # Quack binds here (plain HTTP locally)
-
-FIRST_NAMES = [
-    "James", "Mary", "John", "Patricia", "Robert", "Jennifer", "Michael",
-    "Linda", "William", "Elizabeth", "David", "Barbara", "Richard", "Susan",
-    "Joseph", "Jessica", "Thomas", "Sarah", "Charles", "Karen",
-]
-LAST_NAMES = [
-    "Smith", "Johnson", "Williams", "Brown", "Jones", "Garcia", "Miller",
-    "Davis", "Rodriguez", "Martinez", "Hernandez", "Lopez", "Gonzalez",
-    "Wilson", "Anderson", "Thomas", "Taylor", "Moore", "Jackson", "Martin",
-]
+PROJECT_DIR = Path(__file__).resolve().parent
+SERVER_SCRIPT = PROJECT_DIR / "server.py"
+DATA_DIR = PROJECT_DIR / "data_files_server"     # DuckLake parquet storage
+CATALOG_FILE = PROJECT_DIR / "server_catalog.ducklake"  # DuckLake metadata catalog
+CATALOG_ALIAS = "lake"                           # server-side catalog alias
+TOKEN = "benchtoken1234"                         # shared Quack auth token
+HOST = "localhost"                               # Quack binds here (plain HTTP locally)
+READY_PREFIX = "QUACK_READY"                     # server readiness line prefix
+READY_TIMEOUT = 180.0                            # allows first-time extension download
 
 
-# --- data generation -------------------------------------------------------
+# --- server (subprocess) lifecycle -----------------------------------------
 
-def generate_rows(num_rows: int, *, seed: int = 42):
-    """Return ``num_rows`` synthetic ``(first_name, last_name, email, date)`` tuples."""
-    rng = random.Random(seed)
-    start, end = date(2015, 1, 1), date(2024, 12, 31)
-    span = (end - start).days
-    rows = []
-    for i in range(num_rows):
-        first = rng.choice(FIRST_NAMES)
-        last = rng.choice(LAST_NAMES)
-        email = f"{first.lower()}.{last.lower()}{i}@example.com"
-        user_date = start + timedelta(days=rng.randint(0, span))
-        rows.append((first, last, email, user_date))
-    return rows
-
-
-def _sql_literal(value: str) -> str:
-    """Quote a Python string as a DuckDB SQL string literal."""
-    return "'" + value.replace("'", "''") + "'"
-
-
-# --- server side -----------------------------------------------------------
-
-def reset_table(server_con: duckdb.DuckDBPyConnection) -> None:
-    """(Re)create the partitioned ``user`` table so each run starts clean."""
-    server_con.execute(f"USE {CATALOG_ALIAS}")
-    server_con.execute(f"DROP TABLE IF EXISTS {TABLE}")
-    server_con.execute(
-        f"CREATE TABLE {TABLE} ("
-        "first_name VARCHAR, last_name VARCHAR, email VARCHAR, user_date DATE)"
+def start_server() -> subprocess.Popen:
+    """Launch server.py as a subprocess and block until it signals readiness."""
+    cmd = [
+        sys.executable, str(SERVER_SCRIPT),
+        "--data-dir", str(DATA_DIR),
+        "--catalog", str(CATALOG_FILE),
+        "--catalog-alias", CATALOG_ALIAS,
+        "--token", TOKEN,
+    ]
+    env = dict(os.environ, PYTHONUNBUFFERED="1")
+    proc = subprocess.Popen(
+        cmd,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
+        text=True,
+        cwd=str(PROJECT_DIR),
+        env=env,
     )
-    # Identity partitioning on the DATE column -> one partition per calendar
-    # date, i.e. `user_date` is the partition key (user_date=YYYY-MM-DD).
-    server_con.execute(f"ALTER TABLE {TABLE} SET PARTITIONED BY (user_date)")
 
+    # Drain stdout on a thread so we can enforce a real readiness timeout
+    # (the server is otherwise quiet until it prints the readiness line).
+    lines: queue.Queue[str | None] = queue.Queue()
 
-def start_server() -> duckdb.DuckDBPyConnection:
-    """Start the DuckDB server: DuckLake catalog + partitioned table + Quack."""
-    os.makedirs(DATA_DIR, exist_ok=True)
-    con = duckdb.connect(":memory:")
-    con.execute("INSTALL quack; LOAD quack;")
-    con.execute("INSTALL ducklake; LOAD ducklake;")
-    con.execute(
-        f"ATTACH 'ducklake:{CATALOG_FILE}' AS {CATALOG_ALIAS} "
-        f"(DATA_PATH '{DATA_DIR}/')"
+    def _reader() -> None:
+        assert proc.stdout is not None
+        for line in proc.stdout:
+            lines.put(line)
+        lines.put(None)  # EOF -> process exited
+
+    threading.Thread(target=_reader, daemon=True).start()
+
+    captured: list[str] = []
+    deadline = time.monotonic() + READY_TIMEOUT
+    while time.monotonic() < deadline:
+        try:
+            line = lines.get(timeout=1.0)
+        except queue.Empty:
+            if proc.poll() is not None:
+                break
+            continue
+        if line is None:
+            break  # server exited before becoming ready
+        captured.append(line)
+        if line.startswith(READY_PREFIX):
+            return proc
+
+    # Not ready in time, or exited unexpectedly.
+    stop_server(proc)
+    raise RuntimeError(
+        "Quack server did not become ready. Captured output:\n"
+        + "".join(captured)
     )
-    reset_table(con)
-    con.execute(f"CALL quack_serve('quack:{HOST}', token := '{TOKEN}')")
-    return con
 
 
-def stop_server(server_con: duckdb.DuckDBPyConnection) -> None:
-    server_con.execute(f"CALL quack_stop('quack:{HOST}')")
+def stop_server(proc: subprocess.Popen) -> None:
+    """Terminate the server subprocess gracefully, then force if needed."""
+    if proc.poll() is not None:
+        return
+    proc.terminate()  # SIGTERM -> server.py stops quack and exits 0
+    try:
+        proc.wait(timeout=15)
+    except subprocess.TimeoutExpired:
+        proc.kill()
+        proc.wait(timeout=5)
 
 
 # --- client side -----------------------------------------------------------
@@ -117,7 +127,6 @@ def connect_client() -> duckdb.DuckDBPyConnection:
     """Start the client DuckDB instance and attach the Quack remote."""
     con = duckdb.connect(":memory:")
     con.execute("INSTALL quack; LOAD quack;")
-    # The server listener is up immediately, but retry briefly to be robust.
     last_err: Exception | None = None
     for _ in range(50):
         try:
@@ -127,78 +136,6 @@ def connect_client() -> duckdb.DuckDBPyConnection:
             last_err = err
             time.sleep(0.1)
     raise RuntimeError(f"could not attach Quack remote: {last_err}")
-
-
-def _remote_insert(client_con: duckdb.DuckDBPyConnection, sql: str) -> int:
-    """Run an INSERT on the server via the Quack macro; return affected rows."""
-    rows = client_con.execute(
-        "SELECT * FROM remote_db.query(?)", [sql]
-    ).fetchall()
-    return int(rows[0][0]) if rows else 0
-
-
-def _remote_count(client_con: duckdb.DuckDBPyConnection) -> int:
-    rows = client_con.execute(
-        "SELECT * FROM remote_db.query(?)",
-        [f"SELECT count(*) FROM {CATALOG_ALIAS}.{TABLE}"],
-    ).fetchall()
-    return int(rows[0][0])
-
-
-# --- benchmarks ------------------------------------------------------------
-
-def benchmark_single_row_inserts(client_con: duckdb.DuckDBPyConnection, num_rows: int):
-    """Insert ``num_rows`` rows, one INSERT statement each (one commit/round-trip per row)."""
-    rows = generate_rows(num_rows)
-    start = time.perf_counter()
-    total = 0
-    for first, last, email, user_date in rows:
-        sql = (
-            f"INSERT INTO {CATALOG_ALIAS}.{TABLE} VALUES "
-            f"({_sql_literal(first)}, {_sql_literal(last)}, "
-            f"{_sql_literal(email)}, DATE '{user_date.isoformat()}')"
-        )
-        total += _remote_insert(client_con, sql)
-    elapsed = time.perf_counter() - start
-    assert total == num_rows, f"inserted {total}, expected {num_rows}"
-    return elapsed
-
-
-def benchmark_multi_row_insert(client_con: duckdb.DuckDBPyConnection, num_rows: int):
-    """Insert ``num_rows`` rows in a single multi-row INSERT statement."""
-    rows = generate_rows(num_rows)
-    values = ", ".join(
-        f"({_sql_literal(first)}, {_sql_literal(last)}, "
-        f"{_sql_literal(email)}, DATE '{user_date.isoformat()}')"
-        for first, last, email, user_date in rows
-    )
-    sql = f"INSERT INTO {CATALOG_ALIAS}.{TABLE} VALUES {values}"
-    start = time.perf_counter()
-    total = _remote_insert(client_con, sql)
-    elapsed = time.perf_counter() - start
-    assert total == num_rows, f"inserted {total}, expected {num_rows}"
-    return elapsed
-
-
-# --- reporting -------------------------------------------------------------
-
-def _print_result(label: str, num_rows: int, elapsed: float) -> None:
-    rate = num_rows / elapsed if elapsed > 0 else float("inf")
-    print(
-        f"  {label:<28} {num_rows:>7} rows | "
-        f"{elapsed:8.3f} s | {rate:12.1f} rows/s"
-    )
-
-
-def _data_dir_summary() -> None:
-    parquet = []
-    for root, _dirs, files in os.walk(DATA_DIR):
-        for f in files:
-            if f.endswith(".parquet"):
-                parquet.append(os.path.join(root, f))
-    print(f"  parquet data files written under '{DATA_DIR}/': {len(parquet)}")
-    if parquet:
-        print(f"  example path: {parquet[0]}")
 
 
 # --- entry point -----------------------------------------------------------
@@ -213,40 +150,31 @@ def main() -> None:
     n = args.num_rows
 
     print("=" * 74)
-    print(f" DuckLake INSERT benchmark over the Quack protocol  (num_rows = {n})")
+    print(f" DuckLake INSERT benchmark — DuckDB-file catalog over Quack  (num_rows = {n})")
     print("=" * 74)
+    print(" starting server process (server.py) ...")
 
-    server_con = start_server()
-    client_con = None
+    server_proc = start_server()
+    client_con: duckdb.DuckDBPyConnection | None = None
     try:
         client_con = connect_client()
+        print(f" client attached to server via 'quack:{HOST}'")
 
-        print("\nStrategy                      rows       time            throughput")
-        print("-" * 74)
-
-        reset_table(server_con)
-        t_single = benchmark_single_row_inserts(client_con, n)
-        _print_result("one row per INSERT", n, t_single)
-        print(f"    -> server now holds {_remote_count(client_con)} rows")
-
-        reset_table(server_con)
-        t_multi = benchmark_multi_row_insert(client_con, n)
-        _print_result("single multi-row INSERT", n, t_multi)
-        print(f"    -> server now holds {_remote_count(client_con)} rows")
-
-        print("-" * 74)
-        if t_multi > 0:
-            print(f"  speed-up (single-row / multi-row): {t_single / t_multi:7.1f}x")
+        runner = QuackRunner(client_con, CATALOG_ALIAS)
+        run_insert_benchmark(runner, n)
 
         print()
-        _data_dir_summary()
+        data_dir_summary(DATA_DIR, PROJECT_DIR)
     finally:
         if client_con is not None:
             try:
                 client_con.execute("DETACH remote_db")
             except Exception:
                 pass
-        stop_server(server_con)
+            client_con.close()
+        print("\n stopping server process ...", flush=True)
+        stop_server(server_proc)
+        print(" server stopped.")
 
 
 if __name__ == "__main__":
