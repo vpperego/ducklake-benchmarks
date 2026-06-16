@@ -157,6 +157,46 @@ def time_multi_row_insert(runner: Runner, num_rows: int) -> float:
     return elapsed
 
 
+def time_batched_inserts(
+    runner: Runner, num_rows: int, batch_size: int, *, seed: int = 42, retries: int = 0,
+):
+    """Insert ``num_rows`` rows in batches of ``batch_size`` (one multi-row INSERT
+    per batch). Each batch is its own commit.
+
+    Returns ``(elapsed_seconds, num_batches, num_retries)``. The row count is
+    verified from the INSERT affected-counts (not a global table scan), so this
+    is safe to call from concurrent writers that share the table.
+
+    ``retries`` > 0 re-runs a batch a limited number of times on failure (useful
+    when several writers commit to the same DuckLake catalog concurrently and
+    hit snapshot conflicts).
+    """
+    rows = generate_rows(num_rows, seed=seed)
+    start = time.perf_counter()
+    inserted = 0
+    n_batches = 0
+    n_retries = 0
+    for i in range(0, num_rows, batch_size):
+        batch = rows[i:i + batch_size]
+        sql = build_multi_insert(runner.table, batch)
+        attempt = 0
+        while True:
+            try:
+                result = runner.insert(sql)
+                inserted += int(result[0][0]) if result else len(batch)
+                n_batches += 1
+                break
+            except Exception:
+                attempt += 1
+                if attempt > retries:
+                    raise
+                n_retries += 1
+                time.sleep(0.01 * attempt)
+    elapsed = time.perf_counter() - start
+    assert inserted == num_rows, f"inserted {inserted}, expected {num_rows}"
+    return elapsed, n_batches, n_retries
+
+
 # --- reporting --------------------------------------------------------------
 
 def print_result(label: str, num_rows: int, elapsed: float) -> None:
